@@ -6,6 +6,7 @@ import logging
 import socket
 import subprocess
 import statistics
+import html
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -36,18 +37,24 @@ RENOTIFY_INTERVAL = int(os.getenv("RENOTIFY_INTERVAL", "0"))  # >0: re-send a st
 TELEGRAM_RETRY = int(os.getenv("TELEGRAM_RETRY", "3"))        # attempts per Telegram message
 
 # Local-clock disambiguation: on an offset breach, cross-check an INDEPENDENT reference.
-# If the offset to the reference is out-of-range in the same direction, the local host clock
-# is the likely culprit -- not the monitored server.
 REFERENCE_NTP = os.getenv("REFERENCE_NTP", "").strip()  # empty = disabled
 
-# Per-condition state: name -> {bad, good, active, last_notified}
+# Per-condition state: name -> {bad, good, active, last_notified, since}
 conditions = {}
 
 
-def send_telegram_alert(message):
-    """Send a Telegram message, retrying a few times on failure."""
+# ---------------- Telegram ----------------
+
+def send_telegram_alert(message, parse_mode="HTML"):
+    """Send a Telegram message (HTML formatted), retrying a few times on failure."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "disable_notification": False}
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": parse_mode,
+        "disable_web_page_preview": True,
+        "disable_notification": False,
+    }
     for attempt in range(max(1, TELEGRAM_RETRY)):
         try:
             response = requests.post(url, json=payload, timeout=10)
@@ -60,36 +67,80 @@ def send_telegram_alert(message):
     return False
 
 
+# ---------------- Message formatting ----------------
+
+def _esc(value):
+    return html.escape(str(value))
+
+
+def _leap_str(leap):
+    return {0: "OK", 1: "+1s", 2: "-1s", 3: "UNSYNC ⛔"}.get(leap, str(leap))
+
+
+def _now_str():
+    return time.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _context_line(stratum, leap, root_disp):
+    return (f"<b>Stratum:</b> <code>{stratum}</code>  ·  "
+            f"<b>Leap:</b> <code>{_leap_str(leap)}</code>  ·  "
+            f"<b>Dispersie:</b> <code>{root_disp:.4f}s</code>")
+
+
+def build_msg(emoji, title, server, body_lines):
+    """Assemble a consistent, HTML-formatted Telegram message."""
+    loc = f"  ·  <b>{_esc(LOCATION)}</b>" if LOCATION else ""
+    parts = [f"{emoji} <b>{_esc(title)}</b>{loc}",
+             f"<b>Server:</b> <code>{_esc(server)}</code>"]
+    parts.extend(body_lines)
+    parts.append(f"🕐 <code>{_now_str()}</code>")
+    return "\n".join(parts)
+
+
+# ---------------- Condition state machine ----------------
+
+def _resolve(msg):
+    return msg() if callable(msg) else msg
+
+
 def evaluate_condition(name, is_bad, alert_msg, recover_msg,
                        alert_after=None, recover_after=None):
-    """Edge-triggered alerting with debounce + optional periodic re-notification.
+    """Edge-triggered alerting with debounce, periodic re-notification, and duration tracking.
 
     alert_msg / recover_msg may be strings or zero-arg callables (built lazily so
     expensive work like DNS/ping only runs when a message is actually sent).
     """
     alert_after = ALERT_AFTER if alert_after is None else alert_after
     recover_after = RECOVER_AFTER if recover_after is None else recover_after
-    st = conditions.setdefault(name, {"bad": 0, "good": 0, "active": False, "last_notified": 0.0})
+    st = conditions.setdefault(name, {"bad": 0, "good": 0, "active": False,
+                                      "last_notified": 0.0, "since": 0.0})
     now = time.time()
 
     if is_bad:
         st["bad"] += 1
         st["good"] = 0
         if not st["active"] and st["bad"] >= alert_after:
-            send_telegram_alert(alert_msg() if callable(alert_msg) else alert_msg)
+            send_telegram_alert(_resolve(alert_msg))
             st["active"] = True
             st["last_notified"] = now
+            st["since"] = now
         elif st["active"] and RENOTIFY_INTERVAL > 0 and (now - st["last_notified"]) >= RENOTIFY_INTERVAL:
-            base = alert_msg() if callable(alert_msg) else alert_msg
-            send_telegram_alert(f"🔁 [reminder] {base}")
+            mins = int((now - st["since"]) / 60)
+            send_telegram_alert(f"🔁 <b>[herinnering — al {mins} min actief]</b>\n{_resolve(alert_msg)}")
             st["last_notified"] = now
     else:
         st["good"] += 1
         st["bad"] = 0
         if st["active"] and st["good"] >= recover_after:
-            send_telegram_alert(recover_msg() if callable(recover_msg) else recover_msg)
+            mins = int((now - st["since"]) / 60)
+            msg = _resolve(recover_msg)
+            if mins >= 1:
+                msg += f"\n⏱ <b>Duur van de storing:</b> {mins} min"
+            send_telegram_alert(msg)
             st["active"] = False
 
+
+# ---------------- NTP / diagnostics ----------------
 
 def check_dns_resolution(server):
     try:
@@ -146,11 +197,10 @@ def same_sign(a, b):
 def unreachable_message():
     dns_status, ip_address = check_dns_resolution(NTP_SERVER)
     ping_status, response_time = check_ping(NTP_SERVER)
-    return (
-        f"[{LOCATION}] 🚨 Alert: NTP server {NTP_SERVER} unreachable.\n"
-        f"DNS Resolution: {'Successful, IP: ' + ip_address if dns_status else 'Failed'}\n"
-        f"Ping: {'Successful, Response Time: ' + str(response_time) + ' ms' if ping_status else 'Failed'}"
-    )
+    dns_line = f"✅ OK — <code>{_esc(ip_address)}</code>" if dns_status else "❌ mislukt"
+    ping_line = f"✅ OK — <code>{_esc(response_time)} ms</code>" if ping_status else "❌ mislukt"
+    return build_msg("🚨", "NTP-server onbereikbaar", NTP_SERVER,
+                     [f"<b>DNS:</b> {dns_line}", f"<b>Ping:</b> {ping_line}"])
 
 
 def reset_streaks(*names):
@@ -161,17 +211,19 @@ def reset_streaks(*names):
             st["good"] = 0
 
 
+# ---------------- Main check ----------------
+
 def check_ntp_server():
     responses = sample_server(NTP_SERVER)
 
     # ---- Reachability ----
     if not responses:
         evaluate_condition("unreachable", True, unreachable_message, "")
-        # Don't carry stale offset/quality state while the server is down.
         reset_streaks("offset", "localclock", "stratum", "leap", "rootdisp")
         return
     evaluate_condition("unreachable", False, "",
-                       f"[{LOCATION}] ✅ Recovery: NTP server {NTP_SERVER} is back online.")
+                       build_msg("✅", "NTP-server weer bereikbaar", NTP_SERVER,
+                                 ["De server reageert weer normaal."]))
 
     offset = median_offset(responses)
     stratum = max(r.stratum for r in responses)
@@ -181,9 +233,12 @@ def check_ntp_server():
     logging.info(f"NTP Server: {NTP_SERVER}, Offset: {offset:.6f} seconds, "
                  f"stratum={stratum}, leap={leap}, root_disp={root_disp:.4f}s{detail}")
 
+    ctx = _context_line(stratum, leap, root_disp)
+
     # ---- Offset, with local-clock disambiguation ----
     offset_out = abs(offset) > OFFSET_THRESHOLD
     local_clock_suspect = False
+    ref_offset = None
     if offset_out and REFERENCE_NTP:
         ref = sample_server(REFERENCE_NTP)
         if ref:
@@ -195,17 +250,23 @@ def check_ntp_server():
 
     evaluate_condition(
         "localclock", local_clock_suspect,
-        (f"[{LOCATION}] ⚠️ Alert: THIS host's clock looks off — offset to {NTP_SERVER} and to independent "
-         f"reference {REFERENCE_NTP} are both out-of-range and correlated ({offset:.6f}s). Suspect the local "
-         f"clock, not the server."),
-        f"[{LOCATION}] ✅ Recovery: local clock back in sync (offset to {NTP_SERVER} within threshold).",
+        build_msg("🧭", "Lokale klok verdacht", NTP_SERVER, [
+            f"Offset naar deze server <b>én</b> naar onafhankelijke referentie zijn beide buiten bereik.",
+            f"<b>Offset {_esc(NTP_SERVER)}:</b> <code>{offset:+.6f}s</code>",
+            f"<b>Offset {_esc(REFERENCE_NTP)}:</b> <code>{(ref_offset if ref_offset is not None else 0):+.6f}s</code>",
+            "➡️ Waarschijnlijk de klok van <b>deze host</b>, niet de server.",
+        ]),
+        build_msg("✅", "Lokale klok hersteld", NTP_SERVER,
+                  [f"<b>Offset:</b> <code>{offset:+.6f}s</code> — weer binnen bereik.", ctx]),
     )
-    # Only blame the monitored server when the local clock is not the suspect.
     evaluate_condition(
         "offset", offset_out and not local_clock_suspect,
-        (f"[{LOCATION}] ⚠️ Alert: NTP offset for {NTP_SERVER} out-of-range: {offset:.6f} seconds "
-         f"(Threshold: {OFFSET_THRESHOLD} seconds)"),
-        f"[{LOCATION}] ✅ Recovery: NTP offset for {NTP_SERVER} back within threshold: {offset:.6f} seconds.",
+        build_msg("⚠️", "NTP offset buiten bereik", NTP_SERVER, [
+            f"<b>Offset:</b> <code>{offset:+.6f}s</code>  (drempel <code>±{OFFSET_THRESHOLD}s</code>)",
+            ctx,
+        ]),
+        build_msg("✅", "NTP offset hersteld", NTP_SERVER,
+                  [f"<b>Offset:</b> <code>{offset:+.6f}s</code> — terug binnen drempel <code>±{OFFSET_THRESHOLD}s</code>.", ctx]),
     )
 
     # ---- Sync-quality (absolute server properties; not affected by local clock) ----
@@ -213,20 +274,32 @@ def check_ntp_server():
         stratum_bad = stratum == 0 or stratum > STRATUM_MAX
         evaluate_condition(
             "stratum", stratum_bad,
-            f"[{LOCATION}] ⚠️ Alert: {NTP_SERVER} reports stratum={stratum} (max {STRATUM_MAX}) — server not properly synced.",
-            f"[{LOCATION}] ✅ Recovery: {NTP_SERVER} stratum back to {stratum}.",
+            build_msg("🛰️", "NTP stratum verhoogd", NTP_SERVER, [
+                f"<b>Stratum:</b> <code>{stratum}</code>  (max <code>{STRATUM_MAX}</code>) — server niet goed gesynchroniseerd.",
+                ctx,
+            ]),
+            build_msg("✅", "NTP stratum hersteld", NTP_SERVER,
+                      [f"<b>Stratum:</b> <code>{stratum}</code> — weer normaal.", ctx]),
         )
     if CHECK_LEAP:
         evaluate_condition(
             "leap", leap == 3,
-            f"[{LOCATION}] ⚠️ Alert: {NTP_SERVER} leap indicator = UNSYNCHRONIZED (alarm condition).",
-            f"[{LOCATION}] ✅ Recovery: {NTP_SERVER} leap indicator back to normal.",
+            build_msg("⛔", "NTP leap = UNSYNC (alarm)", NTP_SERVER, [
+                "De server meldt <b>leap = unsynchronized</b> — mogelijk GPS/PPS-verlies of holdover.",
+                ctx,
+            ]),
+            build_msg("✅", "NTP leap hersteld", NTP_SERVER,
+                      [f"<b>Leap:</b> <code>{_leap_str(leap)}</code> — weer normaal.", ctx]),
         )
     if ROOT_DISPERSION_MAX > 0:
         evaluate_condition(
             "rootdisp", root_disp > ROOT_DISPERSION_MAX,
-            f"[{LOCATION}] ⚠️ Alert: {NTP_SERVER} root dispersion {root_disp:.4f}s > {ROOT_DISPERSION_MAX}s — sync uncertainty high (holdover?).",
-            f"[{LOCATION}] ✅ Recovery: {NTP_SERVER} root dispersion back to {root_disp:.4f}s.",
+            build_msg("📈", "NTP root-dispersie hoog", NTP_SERVER, [
+                f"<b>Dispersie:</b> <code>{root_disp:.4f}s</code>  (drempel <code>{ROOT_DISPERSION_MAX}s</code>) — hoge sync-onzekerheid (holdover?).",
+                ctx,
+            ]),
+            build_msg("✅", "NTP dispersie hersteld", NTP_SERVER,
+                      [f"<b>Dispersie:</b> <code>{root_disp:.4f}s</code> — weer laag.", ctx]),
         )
 
 
