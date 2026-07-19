@@ -1,0 +1,53 @@
+# Example: watch two NTP servers from one host.
+# Copy a service block per server you want to monitor.
+#
+# Put secrets in a .env file next to this file:
+#   TELEGRAM_BOT_TOKEN=123456:ABC...
+#   TELEGRAM_CHAT_ID=-100123456789
+#
+# Then:  docker compose up -d
+#
+# Note: on hosts whose Docker daemon uses the journald log driver, remove the
+# `logging:` blocks — json-file options are invalid there (journald rotates itself).
+
+x-common: &common
+  image: ghcr.io/bastiaanbrink/ntp-monitor:latest
+  restart: unless-stopped
+  network_mode: host
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+x-env: &env
+  TELEGRAM_BOT_TOKEN: "${TELEGRAM_BOT_TOKEN}"
+  TELEGRAM_CHAT_ID: "${TELEGRAM_CHAT_ID}"
+  NTP_MONITOR_LOCATION: "SITE"
+  OFFSET_THRESHOLD: "0.05"
+  CHECK_INTERVAL: "60"
+  NTP_RETRY_COUNT: "2"
+  NTP_SAMPLE_COUNT: "5"
+  NTP_SAMPLE_DELAY: "1"
+  ALERT_AFTER: "2"
+  RECOVER_AFTER: "2"
+  STRATUM_MAX: "1"
+  CHECK_LEAP: "true"
+  ROOT_DISPERSION_MAX: "0.5"
+  RENOTIFY_INTERVAL: "1800"
+  REFERENCE_NTP: "time.cloudflare.com"
+
+services:
+  ntp:
+    <<: *common
+    container_name: NTPmonitor-ntp
+    environment:
+      <<: *env
+      NTP_SERVER: "ntp.example.net"
+
+  ntp2:
+    <<: *common
+    container_name: NTPmonitor-ntp2
+    environment:
+      <<: *env
+      NTP_SERVER: "ntp2.example.net"
