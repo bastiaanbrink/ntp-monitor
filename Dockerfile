@@ -29,5 +29,16 @@ ENV NTP_SAMPLE_DELAY="1"
 ENV ALERT_AFTER="1"
 ENV RECOVER_AFTER="1"
 
+# Sync-quality checks (0 / false = disabled, so defaults stay a drop-in)
+ENV NTP_TIMEOUT="5"
+ENV STRATUM_MAX="0"
+ENV CHECK_LEAP="false"
+ENV ROOT_DISPERSION_MAX="0"
+
+# Re-notification, delivery robustness, and local-clock disambiguation
+ENV RENOTIFY_INTERVAL="0"
+ENV TELEGRAM_RETRY="3"
+ENV REFERENCE_NTP=""
+
 # Run the script
 CMD ["python", "ntp_monitor.py"]

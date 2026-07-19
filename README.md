@@ -19,6 +19,15 @@ variables.
 - **Consecutive-strikes debounce** (`ALERT_AFTER` / `RECOVER_AFTER`): require N
   consecutive out-of-range checks before alerting, and N in-range checks before
   recovering. A momentary spike no longer trips an alert.
+- **Sync-quality checks** (`STRATUM_MAX`, `CHECK_LEAP`, `ROOT_DISPERSION_MAX`): a server
+  can be reachable and low-offset yet unsynced (stratum 16, leap alarm, growing
+  dispersion after GPS/holdover loss). These catch that early.
+- **Re-notification** (`RENOTIFY_INTERVAL`): re-send a still-active alert every N seconds
+  so a sustained problem is not announced once and then forgotten. Telegram delivery is
+  retried (`TELEGRAM_RETRY`).
+- **Local-clock disambiguation** (`REFERENCE_NTP`): on an offset breach, cross-check an
+  independent reference server. If the offset to the reference is out-of-range in the same
+  direction, the alert blames *this host's* clock instead of the monitored server.
 
 ## How to Build and Run
 
@@ -56,13 +65,21 @@ docker run -d \
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token. |
 | `TELEGRAM_CHAT_ID` | — | Telegram chat ID. |
 | `NTP_MONITOR_LOCATION` | `""` | Free-text label prefixed to every alert. |
+| `NTP_TIMEOUT` | `5` | **New.** Per-request socket timeout (seconds). |
 | `NTP_SAMPLE_COUNT` | `1` | **New.** Samples per check; the **median** offset is evaluated. |
 | `NTP_SAMPLE_DELAY` | `1` | **New.** Seconds between samples within one check. |
 | `ALERT_AFTER` | `1` | **New.** Consecutive out-of-range checks required before alerting. |
 | `RECOVER_AFTER` | `1` | **New.** Consecutive in-range checks required before recovery. |
+| `STRATUM_MAX` | `0` | **New.** If >0, alert when stratum is 0 (kiss-o'-death) or exceeds this. |
+| `CHECK_LEAP` | `false` | **New.** If true, alert when the leap indicator is 3 (unsynchronised). |
+| `ROOT_DISPERSION_MAX` | `0` | **New.** If >0 (seconds), alert when root dispersion exceeds it. |
+| `RENOTIFY_INTERVAL` | `0` | **New.** If >0 (seconds), re-send a still-active alert this often. |
+| `TELEGRAM_RETRY` | `3` | **New.** Attempts per Telegram message. |
+| `REFERENCE_NTP` | `""` | **New.** Independent reference for local-clock disambiguation (empty = off). |
 
-With the defaults (`NTP_SAMPLE_COUNT=1`, `ALERT_AFTER=1`, `RECOVER_AFTER=1`) the behaviour
-is identical to upstream.
+With the defaults (`NTP_SAMPLE_COUNT=1`, `ALERT_AFTER=1`, `RECOVER_AFTER=1`, all quality
+checks off, `REFERENCE_NTP` empty) the behaviour is identical to upstream — this is a safe
+drop-in replacement.
 
 ## License
 
