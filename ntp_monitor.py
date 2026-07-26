@@ -7,6 +7,10 @@ import socket
 import subprocess
 import statistics
 import html
+import json
+import threading
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -41,6 +45,123 @@ REFERENCE_NTP = os.getenv("REFERENCE_NTP", "").strip()  # empty = disabled
 
 # Per-condition state: name -> {bad, good, active, last_notified, since}
 conditions = {}
+
+
+# ---------------- Read-only HTTP status server (optional) ----------------
+# Enabled only when HTTP_PORT is set; otherwise behaviour is unchanged.
+HTTP_PORT = os.getenv("HTTP_PORT", "").strip()
+
+_status_lock = threading.Lock()
+_latest_status = {
+    "server": NTP_SERVER,
+    "location": LOCATION,
+    "reachable": None,
+    "stratum": None,
+    "leap": None,
+    "offset_ms": None,
+    "offset_median_ms": None,
+    "root_dispersion_ms": None,
+    "alerting": False,
+    "last_check": None,
+    "threshold_ms": round(OFFSET_THRESHOLD * 1000.0, 6),
+    "interval_s": CHECK_INTERVAL,
+}
+
+
+def _any_alert_active():
+    return any(st.get("active") for st in conditions.values())
+
+
+def update_status(reachable, stratum=None, leap=None,
+                  offset=None, offset_median=None, root_disp=None):
+    """Publish the latest computed values for the HTTP status server (non-blocking)."""
+    with _status_lock:
+        _latest_status.update({
+            "server": NTP_SERVER,
+            "location": LOCATION,
+            "reachable": bool(reachable),
+            "stratum": stratum,
+            "leap": leap,
+            "offset_ms": None if offset is None else round(offset * 1000.0, 6),
+            "offset_median_ms": None if offset_median is None else round(offset_median * 1000.0, 6),
+            "root_dispersion_ms": None if root_disp is None else round(root_disp * 1000.0, 6),
+            "alerting": _any_alert_active(),
+            "last_check": datetime.now(timezone.utc).isoformat(),
+            "threshold_ms": round(OFFSET_THRESHOLD * 1000.0, 6),
+            "interval_s": CHECK_INTERVAL,
+        })
+
+
+def _render_metrics():
+    with _status_lock:
+        s = dict(_latest_status)
+    labels = 'server="%s",location="%s"' % (s["server"], s["location"])
+    out = []
+
+    def gauge(name, val, help_text):
+        out.append(f"# HELP {name} {help_text}")
+        out.append(f"# TYPE {name} gauge")
+        if val is not None:
+            out.append(f"{name}{{{labels}}} {val}")
+
+    gauge("ntp_reachable", None if s["reachable"] is None else int(s["reachable"]),
+          "1 if the NTP server responded on the last check, else 0")
+    gauge("ntp_stratum", s["stratum"], "NTP stratum reported on the last check")
+    gauge("ntp_leap", s["leap"], "NTP leap indicator (0 ok, 3 unsync)")
+    gauge("ntp_offset_ms", s["offset_ms"], "Last-sample clock offset in milliseconds")
+    gauge("ntp_offset_median_ms", s["offset_median_ms"], "Median clock offset in milliseconds")
+    gauge("ntp_root_dispersion_ms", s["root_dispersion_ms"], "Root dispersion in milliseconds")
+    gauge("ntp_alerting", int(bool(s["alerting"])), "1 if any alert condition is currently active")
+    return "\n".join(out) + "\n"
+
+
+class _StatusHandler(BaseHTTPRequestHandler):
+    server_version = "ntp-monitor-status/1.0"
+
+    def log_message(self, *args):  # silence per-request logging
+        pass
+
+    def _send(self, code, body, content_type):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if path == "/status":
+            with _status_lock:
+                body = json.dumps(_latest_status)
+            self._send(200, body, "application/json")
+        elif path == "/metrics":
+            self._send(200, _render_metrics(), "text/plain; version=0.0.4; charset=utf-8")
+        elif path in ("/", "/health", "/healthz"):
+            self._send(200, "ok\n", "text/plain; charset=utf-8")
+        else:
+            self._send(404, "not found\n", "text/plain; charset=utf-8")
+
+    do_HEAD = do_GET
+
+
+def start_http_server():
+    """Start the read-only status server in a daemon thread if HTTP_PORT is set."""
+    if not HTTP_PORT:
+        return
+    try:
+        port = int(HTTP_PORT)
+    except ValueError:
+        logging.error(f"Invalid HTTP_PORT={HTTP_PORT!r}; status server disabled")
+        return
+    try:
+        httpd = ThreadingHTTPServer(("0.0.0.0", port), _StatusHandler)
+    except Exception as e:
+        logging.error(f"Failed to start status server on port {port}: {e}")
+        return
+    threading.Thread(target=httpd.serve_forever, name="status-http", daemon=True).start()
+    logging.info(f"Status HTTP server listening on 0.0.0.0:{port} (/status, /metrics)")
 
 
 # ---------------- Telegram ----------------
@@ -220,6 +341,7 @@ def check_ntp_server():
     if not responses:
         evaluate_condition("unreachable", True, unreachable_message, "")
         reset_streaks("offset", "localclock", "stratum", "leap", "rootdisp")
+        update_status(reachable=False)
         return
     evaluate_condition("unreachable", False, "",
                        build_msg("✅", "NTP server back online", NTP_SERVER,
@@ -302,8 +424,13 @@ def check_ntp_server():
                       [f"<b>Dispersion:</b> <code>{root_disp:.4f}s</code> — back to normal.", ctx]),
         )
 
+    update_status(reachable=True, stratum=stratum, leap=leap,
+                  offset=responses[-1].offset, offset_median=offset,
+                  root_disp=root_disp)
+
 
 def main():
+    start_http_server()
     while True:
         check_ntp_server()
         time.sleep(CHECK_INTERVAL)

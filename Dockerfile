@@ -40,5 +40,8 @@ ENV RENOTIFY_INTERVAL="0"
 ENV TELEGRAM_RETRY="3"
 ENV REFERENCE_NTP=""
 
+# Optional read-only HTTP status server (empty/unset = disabled = original behaviour)
+ENV HTTP_PORT=""
+
 # Run the script
 CMD ["python", "ntp_monitor.py"]
