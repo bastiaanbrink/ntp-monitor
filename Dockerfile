@@ -14,6 +14,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the script
 COPY ntp_monitor.py .
 
+# Log to stdout unbuffered so `docker logs` reflects checks in real time
+# (block-buffered stdout otherwise delays output by minutes/hours).
+ENV PYTHONUNBUFFERED="1"
+
 # Expose environment variables
 ENV NTP_SERVER="pool.ntp.org"
 ENV OFFSET_THRESHOLD="0.5"
@@ -22,6 +26,10 @@ ENV TELEGRAM_CHAT_ID=""
 ENV CHECK_INTERVAL="60"
 ENV NTP_RETRY_COUNT="1"
 ENV NTP_MONITOR_LOCATION=""
+
+# Address family: auto (default, resolver picks) | 4 (IPv4/A only) | 6 (IPv6/AAAA only).
+# Run one container per family to monitor IPv4 and IPv6 paths separately.
+ENV NTP_IP_VERSION="auto"
 
 # Noise-reduction knobs (defaults keep the original single-sample behaviour)
 ENV NTP_SAMPLE_COUNT="1"

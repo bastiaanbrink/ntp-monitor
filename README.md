@@ -50,6 +50,8 @@ recovery the next cycle), which produces alert spam. This fork adds the followin
 | **Re-notification + retry** | `RENOTIFY_INTERVAL`, `TELEGRAM_RETRY` | Re-send a still-active alert periodically so a sustained problem isn't announced once and forgotten; retry Telegram delivery on failure. |
 | **Local-clock disambiguation** | `REFERENCE_NTP` | On an offset breach, cross-check an independent reference. If the offset to it is out-of-range in the same direction, the alert blames *this host's* clock, not the monitored server. |
 | **Richer alerts** | — | Structured HTML messages: headline, server, the triggering metric vs. threshold, a stratum/leap/dispersion context line, a timestamp, and outage duration on reminders/recovery. |
+| **Per-family (IPv4/IPv6)** | `NTP_IP_VERSION` | Pin a container to the `A` (`4`) or `AAAA` (`6`) record so IPv4 and IPv6 reachability are monitored as **separate targets** — a broken path on one family is caught even when the other is fine. The chosen protocol is shown in the alert header, `/status` and `/metrics`. |
+| **Real-time logs + status endpoint** | `HTTP_PORT` | `PYTHONUNBUFFERED=1` is baked in so `docker logs` reflects each check immediately; an optional read-only HTTP server exposes `/status` (JSON) and `/metrics` (Prometheus). |
 
 ## How it behaves
 
@@ -90,6 +92,8 @@ RENOTIFY_INTERVAL=1800     REFERENCE_NTP=time.cloudflare.com
 | Variable | Default | Description |
 |---|---|---|
 | `NTP_SERVER` | `pool.ntp.org` | Hostname/IP of the NTP server to check. |
+| `NTP_IP_VERSION` | `auto` | `auto` = resolver picks; `4` = force IPv4 (A record); `6` = force IPv6 (AAAA). Run one container per family to monitor both paths separately. |
+| `HTTP_PORT` | `""` | If set, serve read-only `/status` (JSON) and `/metrics` (Prometheus) on this port. Use a distinct port per container. |
 | `OFFSET_THRESHOLD` | `0.5` | Max absolute median offset (seconds) before out-of-range. |
 | `CHECK_INTERVAL` | `60` | Seconds between checks. |
 | `NTP_RETRY_COUNT` | `1` | Attempts per sample before it counts as failed (reachability). |
@@ -115,6 +119,9 @@ checks off, `REFERENCE_NTP` empty) the behaviour is identical to upstream.
 
 - **`--network host`** lets the container's clock match the host's, which is what you want
   when measuring offset.
+- **IPv4 vs IPv6:** with `NTP_IP_VERSION=6` on a host that has no global IPv6 address, every
+  check reports the server as unreachable (that path genuinely is). Only deploy the `6`
+  container on hosts with working IPv6; otherwise it's constant-alert noise.
 - **Log rotation:** the `--log-opt` flags above apply to the `json-file` driver. If your
   Docker daemon uses the **journald** driver, those options are invalid — drop them and let
   journald/systemd handle rotation.

@@ -37,17 +37,24 @@ x-env: &env
   RENOTIFY_INTERVAL: "1800"
   REFERENCE_NTP: "time.cloudflare.com"
 
+# Monitor IPv4 and IPv6 as separate targets by running one container per family
+# (NTP_IP_VERSION = 4 or 6). Give each its own HTTP_PORT for /status + /metrics.
+# Only deploy the v6 container on hosts that actually have global IPv6.
 services:
-  ntp:
+  ntp-v4:
     <<: *common
-    container_name: NTPmonitor-ntp
+    container_name: NTPmonitor-ntp-v4
     environment:
       <<: *env
       NTP_SERVER: "ntp.example.net"
+      NTP_IP_VERSION: "4"
+      HTTP_PORT: "9601"
 
-  ntp2:
+  ntp-v6:
     <<: *common
-    container_name: NTPmonitor-ntp2
+    container_name: NTPmonitor-ntp-v6
     environment:
       <<: *env
-      NTP_SERVER: "ntp2.example.net"
+      NTP_SERVER: "ntp.example.net"
+      NTP_IP_VERSION: "6"
+      HTTP_PORT: "9611"

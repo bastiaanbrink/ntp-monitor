@@ -25,6 +25,15 @@ NTP_RETRY_COUNT = int(os.getenv("NTP_RETRY_COUNT", "1"))  # attempts per sample 
 NTP_TIMEOUT = float(os.getenv("NTP_TIMEOUT", "5"))       # per-request socket timeout (seconds)
 LOCATION = os.getenv("NTP_MONITOR_LOCATION", "").strip()
 
+# Address family: monitor IPv4 and IPv6 as separate targets.
+#   auto -> let the resolver pick (original behaviour)
+#   4    -> force IPv4 (A record) only
+#   6    -> force IPv6 (AAAA record) only
+# Run two containers (one with 4, one with 6) to watch both paths independently.
+NTP_IP_VERSION = os.getenv("NTP_IP_VERSION", "auto").strip().lower()
+_FAMILY = {"4": socket.AF_INET, "6": socket.AF_INET6}.get(NTP_IP_VERSION, socket.AF_UNSPEC)
+_PROTO_LABEL = {"4": "IPv4", "6": "IPv6"}.get(NTP_IP_VERSION, "auto")
+
 # Noise reduction (defaults preserve the original single-sample behaviour)
 NTP_SAMPLE_COUNT = int(os.getenv("NTP_SAMPLE_COUNT", "1"))   # samples per check; the MEDIAN offset is evaluated
 NTP_SAMPLE_DELAY = float(os.getenv("NTP_SAMPLE_DELAY", "1"))  # seconds between samples within one check
@@ -55,6 +64,8 @@ _status_lock = threading.Lock()
 _latest_status = {
     "server": NTP_SERVER,
     "location": LOCATION,
+    "proto": _PROTO_LABEL,
+    "target_ip": None,
     "reachable": None,
     "stratum": None,
     "leap": None,
@@ -73,12 +84,15 @@ def _any_alert_active():
 
 
 def update_status(reachable, stratum=None, leap=None,
-                  offset=None, offset_median=None, root_disp=None):
+                  offset=None, offset_median=None, root_disp=None,
+                  proto=None, target_ip=None):
     """Publish the latest computed values for the HTTP status server (non-blocking)."""
     with _status_lock:
         _latest_status.update({
             "server": NTP_SERVER,
             "location": LOCATION,
+            "proto": proto if proto is not None else _PROTO_LABEL,
+            "target_ip": target_ip,
             "reachable": bool(reachable),
             "stratum": stratum,
             "leap": leap,
@@ -95,7 +109,7 @@ def update_status(reachable, stratum=None, leap=None,
 def _render_metrics():
     with _status_lock:
         s = dict(_latest_status)
-    labels = 'server="%s",location="%s"' % (s["server"], s["location"])
+    labels = 'server="%s",location="%s",proto="%s"' % (s["server"], s["location"], s["proto"])
     out = []
 
     def gauge(name, val, help_text):
@@ -210,7 +224,12 @@ def _context_line(stratum, leap, root_disp):
 
 def build_msg(emoji, title, server, body_lines):
     """Assemble a consistent, HTML-formatted Telegram message."""
-    loc = f"  ·  <b>{_esc(LOCATION)}</b>" if LOCATION else ""
+    tags = []
+    if LOCATION:
+        tags.append(_esc(LOCATION))
+    if _PROTO_LABEL != "auto":
+        tags.append(_PROTO_LABEL)
+    loc = f"  ·  <b>{' / '.join(tags)}</b>" if tags else ""
     parts = [f"{emoji} <b>{_esc(title)}</b>{loc}",
              f"<b>Server:</b> <code>{_esc(server)}</code>"]
     parts.extend(body_lines)
@@ -263,17 +282,39 @@ def evaluate_condition(name, is_bad, alert_msg, recover_msg,
 
 # ---------------- NTP / diagnostics ----------------
 
-def check_dns_resolution(server):
+def resolve_target(server):
+    """Resolve `server` to a single literal IP of the configured address family.
+
+    Returns (ip, proto) with proto in {"IPv4", "IPv6"}, or (None, None) when the
+    server has no address of the requested family (missing A/AAAA record or a
+    DNS failure). Passing the literal on to ntplib pins the query to that family.
+    """
     try:
-        return True, socket.gethostbyname(server)
-    except socket.error:
-        return False, None
+        infos = socket.getaddrinfo(server, 123, _FAMILY, socket.SOCK_DGRAM)
+    except socket.gaierror:
+        return None, None
+    if not infos:
+        return None, None
+    family = infos[0][0]
+    ip = infos[0][4][0]
+    return ip, ("IPv6" if family == socket.AF_INET6 else "IPv4")
+
+
+def check_dns_resolution(server):
+    """Resolve within the configured family; returns (ok, literal_ip)."""
+    ip, _ = resolve_target(server)
+    return (ip is not None), ip
 
 
 def check_ping(server):
     try:
-        result = subprocess.run(["ping", "-c", "1", server],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        cmd = ["ping", "-c", "1", "-w", "2"]
+        if _FAMILY == socket.AF_INET6:
+            cmd.append("-6")
+        elif _FAMILY == socket.AF_INET:
+            cmd.append("-4")
+        cmd.append(server)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if result.returncode == 0:
             for line in result.stdout.splitlines():
                 if "time=" in line:
@@ -284,22 +325,25 @@ def check_ping(server):
         return False, None
 
 
-def query_once(server):
-    """One NTP request with NTP_RETRY_COUNT attempts. Returns an NTPStats response or None."""
+def query_once(address):
+    """One NTP request with NTP_RETRY_COUNT attempts. Returns an NTPStats response or None.
+
+    `address` is a resolved literal IP so the query stays pinned to the chosen family.
+    """
     for attempt in range(NTP_RETRY_COUNT):
         try:
-            return ntplib.NTPClient().request(server, version=3, timeout=NTP_TIMEOUT)
+            return ntplib.NTPClient().request(address, version=3, timeout=NTP_TIMEOUT)
         except Exception as e:
-            logging.debug(f"{server} attempt {attempt + 1}/{NTP_RETRY_COUNT} failed: {e}")
+            logging.debug(f"{address} attempt {attempt + 1}/{NTP_RETRY_COUNT} failed: {e}")
             time.sleep(2)
     return None
 
 
-def sample_server(server):
-    """Collect up to NTP_SAMPLE_COUNT responses from a server."""
+def sample_server(address):
+    """Collect up to NTP_SAMPLE_COUNT responses from a resolved literal IP."""
     responses = []
     for i in range(NTP_SAMPLE_COUNT):
-        r = query_once(server)
+        r = query_once(address)
         if r is not None:
             responses.append(r)
         if i < NTP_SAMPLE_COUNT - 1 and NTP_SAMPLE_DELAY > 0:
@@ -318,10 +362,10 @@ def same_sign(a, b):
 def unreachable_message():
     dns_status, ip_address = check_dns_resolution(NTP_SERVER)
     ping_status, response_time = check_ping(NTP_SERVER)
-    dns_line = f"✅ OK — <code>{_esc(ip_address)}</code>" if dns_status else "❌ failed"
+    dns_line = f"✅ OK — <code>{_esc(ip_address)}</code>" if dns_status else f"❌ no {_PROTO_LABEL} address"
     ping_line = f"✅ OK — <code>{_esc(response_time)} ms</code>" if ping_status else "❌ failed"
     return build_msg("🚨", "NTP server unreachable", NTP_SERVER,
-                     [f"<b>DNS:</b> {dns_line}", f"<b>Ping:</b> {ping_line}"])
+                     [f"<b>DNS ({_PROTO_LABEL}):</b> {dns_line}", f"<b>Ping:</b> {ping_line}"])
 
 
 def reset_streaks(*names):
@@ -335,13 +379,22 @@ def reset_streaks(*names):
 # ---------------- Main check ----------------
 
 def check_ntp_server():
-    responses = sample_server(NTP_SERVER)
+    target_ip, proto = resolve_target(NTP_SERVER)
+
+    # ---- No address of the requested family (missing A/AAAA or DNS failure) ----
+    if target_ip is None:
+        evaluate_condition("unreachable", True, unreachable_message, "")
+        reset_streaks("offset", "localclock", "stratum", "leap", "rootdisp")
+        update_status(reachable=False, proto=_PROTO_LABEL, target_ip=None)
+        return
+
+    responses = sample_server(target_ip)
 
     # ---- Reachability ----
     if not responses:
         evaluate_condition("unreachable", True, unreachable_message, "")
         reset_streaks("offset", "localclock", "stratum", "leap", "rootdisp")
-        update_status(reachable=False)
+        update_status(reachable=False, proto=proto, target_ip=target_ip)
         return
     evaluate_condition("unreachable", False, "",
                        build_msg("✅", "NTP server back online", NTP_SERVER,
@@ -352,7 +405,7 @@ def check_ntp_server():
     leap = 3 if any(r.leap == 3 for r in responses) else responses[-1].leap
     root_disp = statistics.median([r.root_dispersion for r in responses])
     detail = "" if len(responses) <= 1 else f" (median of {len(responses)})"
-    logging.info(f"NTP Server: {NTP_SERVER}, Offset: {offset:.6f} seconds, "
+    logging.info(f"NTP Server: {NTP_SERVER} [{proto} {target_ip}], Offset: {offset:.6f} seconds, "
                  f"stratum={stratum}, leap={leap}, root_disp={root_disp:.4f}s{detail}")
 
     ctx = _context_line(stratum, leap, root_disp)
@@ -362,7 +415,8 @@ def check_ntp_server():
     local_clock_suspect = False
     ref_offset = None
     if offset_out and REFERENCE_NTP:
-        ref = sample_server(REFERENCE_NTP)
+        ref_ip, _ = resolve_target(REFERENCE_NTP)
+        ref = sample_server(ref_ip) if ref_ip else []
         if ref:
             ref_offset = median_offset(ref)
             if abs(ref_offset) > OFFSET_THRESHOLD and same_sign(ref_offset, offset):
@@ -426,7 +480,7 @@ def check_ntp_server():
 
     update_status(reachable=True, stratum=stratum, leap=leap,
                   offset=responses[-1].offset, offset_median=offset,
-                  root_disp=root_disp)
+                  root_disp=root_disp, proto=proto, target_ip=target_ip)
 
 
 def main():
