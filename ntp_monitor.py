@@ -67,6 +67,9 @@ conditions = {}
 # ---------------- Read-only HTTP status server (optional) ----------------
 # Enabled only when HTTP_PORT is set; otherwise behaviour is unchanged.
 HTTP_PORT = os.getenv("HTTP_PORT", "").strip()
+# Address to bind the status server to. Default 0.0.0.0 (original behaviour); with --network host that exposes
+# /status and /metrics on every interface, so set e.g. 127.0.0.1 (or a VPN address) on internet-facing hosts.
+HTTP_BIND = os.getenv("HTTP_BIND", "0.0.0.0").strip() or "0.0.0.0"
 
 _status_lock = threading.Lock()
 _latest_status = {
@@ -193,12 +196,14 @@ def start_http_server():
         logging.error(f"Invalid HTTP_PORT={HTTP_PORT!r}; status server disabled")
         return
     try:
-        httpd = ThreadingHTTPServer(("0.0.0.0", port), _StatusHandler)
+        family = socket.AF_INET6 if ":" in HTTP_BIND else socket.AF_INET
+        server_cls = type("_StatusServer", (ThreadingHTTPServer,), {"address_family": family})
+        httpd = server_cls((HTTP_BIND, port), _StatusHandler)
     except Exception as e:
         logging.error(f"Failed to start status server on port {port}: {e}")
         return
     threading.Thread(target=httpd.serve_forever, name="status-http", daemon=True).start()
-    logging.info(f"Status HTTP server listening on 0.0.0.0:{port} (/status, /metrics)")
+    logging.info(f"Status HTTP server listening on {HTTP_BIND}:{port} (/status, /metrics)")
 
 
 # ---------------- Telegram ----------------

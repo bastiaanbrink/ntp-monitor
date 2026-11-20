@@ -50,6 +50,8 @@ ENV REFERENCE_NTP=""
 
 # Optional read-only HTTP status server (empty/unset = disabled = original behaviour)
 ENV HTTP_PORT=""
+# Bind address for the status server (0.0.0.0 = all interfaces; use 127.0.0.1 on internet-facing hosts)
+ENV HTTP_BIND="0.0.0.0"
 
 # Optional NTS (RFC 8915) key-establishment check on TCP NTS_PORT (TLS 1.3, ALPN ntske/1, cookies),
 # pinned to NTP_IP_VERSION like the NTP query; NTS_CERT_WARN_DAYS>0 also alerts on certificate expiry.
