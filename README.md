@@ -95,7 +95,7 @@ RENOTIFY_INTERVAL=1800     REFERENCE_NTP=time.cloudflare.com
 | `NTP_SERVER` | `pool.ntp.org` | Hostname/IP of the NTP server to check. |
 | `NTP_IP_VERSION` | `auto` | `auto` = resolver picks; `4` = force IPv4 (A record); `6` = force IPv6 (AAAA). Run one container per family to monitor both paths separately. |
 | `HTTP_PORT` | `""` | If set, serve read-only `/status` (JSON) and `/metrics` (Prometheus) on this port. Use a distinct port per container. |
-| `HTTP_BIND` | `0.0.0.0` | Address the status server binds to. With `--network host` the default exposes `/status` and `/metrics` on all interfaces, including the public one: set `127.0.0.1` (or a VPN/Tailscale address) on internet-facing hosts. IPv6 literals work too. |
+| `HTTP_BIND` | `0.0.0.0` | Address the status server binds to. With `--network host` the default exposes `/status` and `/metrics` on all interfaces, including the public one: set `127.0.0.1` (or a VPN/Tailscale address) on internet-facing hosts. IPv6 literals work too. If the address does not exist yet (VPN still starting after a reboot) the bind is retried with backoff (5 s → 60 s) instead of disabling the status server. |
 | `NTS_CHECK` | `false` | `true` = also check NTS-KE (RFC 8915) each cycle; alerts "NTS key establishment failed" / recovered (debounced like the others). `/status` gains `nts_ok`, `nts_cookies`, `nts_cert_days`, `nts_error`; `/metrics` gains `nts_ok`, `nts_cookies`, `nts_cert_days`. |
 | `NTS_PORT` | `4460` | NTS-KE TCP port. |
 | `NTS_CERT_WARN_DAYS` | `0` | `>0`: alert when the NTS-KE certificate expires within N days (e.g. `20` with Let's Encrypt, which renews at 30). |

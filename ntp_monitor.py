@@ -195,15 +195,26 @@ def start_http_server():
     except ValueError:
         logging.error(f"Invalid HTTP_PORT={HTTP_PORT!r}; status server disabled")
         return
-    try:
-        family = socket.AF_INET6 if ":" in HTTP_BIND else socket.AF_INET
-        server_cls = type("_StatusServer", (ThreadingHTTPServer,), {"address_family": family})
-        httpd = server_cls((HTTP_BIND, port), _StatusHandler)
-    except Exception as e:
-        logging.error(f"Failed to start status server on port {port}: {e}")
-        return
-    threading.Thread(target=httpd.serve_forever, name="status-http", daemon=True).start()
-    logging.info(f"Status HTTP server listening on {HTTP_BIND}:{port} (/status, /metrics)")
+    family = socket.AF_INET6 if ":" in HTTP_BIND else socket.AF_INET
+    server_cls = type("_StatusServer", (ThreadingHTTPServer,), {"address_family": family})
+
+    def _serve():
+        # Retry binding: with HTTP_BIND set to a VPN address (e.g. Tailscale) the container can start before the
+        # address exists after a reboot ("Cannot assign requested address"); keep trying instead of giving up.
+        delay = 5
+        while True:
+            try:
+                httpd = server_cls((HTTP_BIND, port), _StatusHandler)
+            except OSError as e:
+                logging.warning(f"Status server bind {HTTP_BIND}:{port} failed ({e}); retrying in {delay}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            logging.info(f"Status HTTP server listening on {HTTP_BIND}:{port} (/status, /metrics)")
+            httpd.serve_forever()
+            return
+
+    threading.Thread(target=_serve, name="status-http", daemon=True).start()
 
 
 # ---------------- Telegram ----------------
