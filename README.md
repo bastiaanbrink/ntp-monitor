@@ -52,6 +52,7 @@ recovery the next cycle), which produces alert spam. This fork adds the followin
 | **Richer alerts** | — | Structured HTML messages: headline, server, the triggering metric vs. threshold, a stratum/leap/dispersion context line, a timestamp, and outage duration on reminders/recovery. |
 | **Per-family (IPv4/IPv6)** | `NTP_IP_VERSION` | Pin a container to the `A` (`4`) or `AAAA` (`6`) record so IPv4 and IPv6 reachability are monitored as **separate targets** — a broken path on one family is caught even when the other is fine. The chosen protocol is shown in the alert header, `/status` and `/metrics`. |
 | **Real-time logs + status endpoint** | `HTTP_PORT` | `PYTHONUNBUFFERED=1` is baked in so `docker logs` reflects each check immediately; an optional read-only HTTP server exposes `/status` (JSON) and `/metrics` (Prometheus). |
+| **NTS key establishment** | `NTS_CHECK`, `NTS_CERT_WARN_DAYS` | Real RFC 8915 NTS-KE exchange per check: TLS 1.3 on TCP `NTS_PORT` (4460) with ALPN `ntske/1`, certificate verified against `NTP_SERVER`, NTPv4 + AES-SIV-CMAC-256 negotiated, cookies required. Pinned to `NTP_IP_VERSION`, so a TCP filter on one family is caught even when UDP NTP works. Optional alert when the certificate is close to expiry. Pure stdlib (no extra dependencies). |
 
 ## How it behaves
 
@@ -94,6 +95,9 @@ RENOTIFY_INTERVAL=1800     REFERENCE_NTP=time.cloudflare.com
 | `NTP_SERVER` | `pool.ntp.org` | Hostname/IP of the NTP server to check. |
 | `NTP_IP_VERSION` | `auto` | `auto` = resolver picks; `4` = force IPv4 (A record); `6` = force IPv6 (AAAA). Run one container per family to monitor both paths separately. |
 | `HTTP_PORT` | `""` | If set, serve read-only `/status` (JSON) and `/metrics` (Prometheus) on this port. Use a distinct port per container. |
+| `NTS_CHECK` | `false` | `true` = also check NTS-KE (RFC 8915) each cycle; alerts "NTS key establishment failed" / recovered (debounced like the others). `/status` gains `nts_ok`, `nts_cookies`, `nts_cert_days`, `nts_error`; `/metrics` gains `nts_ok`, `nts_cookies`, `nts_cert_days`. |
+| `NTS_PORT` | `4460` | NTS-KE TCP port. |
+| `NTS_CERT_WARN_DAYS` | `0` | `>0`: alert when the NTS-KE certificate expires within N days (e.g. `20` with Let's Encrypt, which renews at 30). |
 | `OFFSET_THRESHOLD` | `0.5` | Max absolute median offset (seconds) before out-of-range. |
 | `CHECK_INTERVAL` | `60` | Seconds between checks. |
 | `NTP_RETRY_COUNT` | `1` | Attempts per sample before it counts as failed (reachability). |

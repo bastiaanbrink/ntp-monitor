@@ -52,6 +52,14 @@ TELEGRAM_RETRY = int(os.getenv("TELEGRAM_RETRY", "3"))        # attempts per Tel
 # Local-clock disambiguation: on an offset breach, cross-check an INDEPENDENT reference.
 REFERENCE_NTP = os.getenv("REFERENCE_NTP", "").strip()  # empty = disabled
 
+# NTS (RFC 8915) key-establishment check (disabled by default -> drop-in compatible).
+# Each check opens TLS 1.3 to NTS_PORT with ALPN "ntske/1" (pinned to NTP_IP_VERSION like the NTP query),
+# verifies the certificate against NTP_SERVER, performs a real NTS-KE exchange (NTPv4 + AES-SIV-CMAC-256)
+# and requires at least one cookie back. Optionally alerts when the certificate is about to expire.
+NTS_CHECK = os.getenv("NTS_CHECK", "false").lower() in ("1", "true", "yes", "on")
+NTS_PORT = int(os.getenv("NTS_PORT", "4460"))
+NTS_CERT_WARN_DAYS = int(os.getenv("NTS_CERT_WARN_DAYS", "0"))  # >0: alert when the cert expires within N days
+
 # Per-condition state: name -> {bad, good, active, last_notified, since}
 conditions = {}
 
@@ -76,6 +84,10 @@ _latest_status = {
     "last_check": None,
     "threshold_ms": round(OFFSET_THRESHOLD * 1000.0, 6),
     "interval_s": CHECK_INTERVAL,
+    "nts_ok": None,
+    "nts_cookies": None,
+    "nts_cert_days": None,
+    "nts_error": None,
 }
 
 
@@ -106,6 +118,12 @@ def update_status(reachable, stratum=None, leap=None,
         })
 
 
+def update_nts_status(ok, cookies=None, cert_days=None, error=None):
+    with _status_lock:
+        _latest_status.update({"nts_ok": ok, "nts_cookies": cookies,
+                               "nts_cert_days": cert_days, "nts_error": error})
+
+
 def _render_metrics():
     with _status_lock:
         s = dict(_latest_status)
@@ -126,6 +144,11 @@ def _render_metrics():
     gauge("ntp_offset_median_ms", s["offset_median_ms"], "Median clock offset in milliseconds")
     gauge("ntp_root_dispersion_ms", s["root_dispersion_ms"], "Root dispersion in milliseconds")
     gauge("ntp_alerting", int(bool(s["alerting"])), "1 if any alert condition is currently active")
+    if NTS_CHECK:
+        gauge("nts_ok", None if s["nts_ok"] is None else int(s["nts_ok"]),
+              "1 if the last NTS-KE exchange succeeded (TLS, ALPN ntske/1, cookies received)")
+        gauge("nts_cookies", s["nts_cookies"], "Number of NTS cookies received on the last check")
+        gauge("nts_cert_days", s["nts_cert_days"], "Days until the NTS-KE TLS certificate expires")
     return "\n".join(out) + "\n"
 
 
@@ -376,6 +399,125 @@ def reset_streaks(*names):
             st["good"] = 0
 
 
+# ---------------- NTS-KE (RFC 8915) ----------------
+
+_NTSKE_EOM, _NTSKE_NEXTPROTO, _NTSKE_ERROR, _NTSKE_WARNING, _NTSKE_AEAD, _NTSKE_COOKIE = 0, 1, 2, 3, 4, 5
+_AEAD_AES_SIV_CMAC_256 = 15
+
+
+def _ntske_record(rtype, body=b"", critical=True):
+    return ((0x8000 if critical else 0) | rtype).to_bytes(2, "big") + len(body).to_bytes(2, "big") + body
+
+
+def nts_ke_check(server, address):
+    """Real NTS-KE exchange against `address` (literal IP, pinned family) with SNI/verification for `server`.
+
+    Returns dict(ok, cookies, cert_days, error). Uses only the stdlib (ssl); the authenticated NTP exchange
+    itself is not performed (needs AES-SIV), but a server that hands out cookies for NTPv4/AES-SIV-CMAC-256
+    over a verified TLS 1.3 session is a working NTS server.
+    """
+    import ssl
+    res = {"ok": False, "cookies": 0, "cert_days": None, "error": None}
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    ctx.set_alpn_protocols(["ntske/1"])
+    try:
+        with socket.create_connection((address, NTS_PORT), timeout=NTP_TIMEOUT) as raw:
+            with ctx.wrap_socket(raw, server_hostname=server) as tls:
+                if tls.selected_alpn_protocol() != "ntske/1":
+                    res["error"] = f"ALPN not negotiated ({tls.selected_alpn_protocol()})"
+                    return res
+                cert = tls.getpeercert()
+                if cert and cert.get("notAfter"):
+                    res["cert_days"] = int((ssl.cert_time_to_seconds(cert["notAfter"]) - time.time()) // 86400)
+                tls.sendall(_ntske_record(_NTSKE_NEXTPROTO, (0).to_bytes(2, "big"))
+                            + _ntske_record(_NTSKE_AEAD, _AEAD_AES_SIV_CMAC_256.to_bytes(2, "big"))
+                            + _ntske_record(_NTSKE_EOM))
+                buf = b""
+                while True:
+                    chunk = tls.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    if _ntske_has_eom(buf):
+                        break
+    except ssl.SSLCertVerificationError as e:
+        res["error"] = f"certificate: {e.verify_message}"
+        return res
+    except Exception as e:
+        res["error"] = f"{type(e).__name__}: {e}"
+        return res
+    proto = aead = None
+    i = 0
+    while i + 4 <= len(buf):
+        rtype = int.from_bytes(buf[i:i + 2], "big") & 0x7FFF
+        ln = int.from_bytes(buf[i + 2:i + 4], "big")
+        body = buf[i + 4:i + 4 + ln]
+        i += 4 + ln
+        if rtype == _NTSKE_EOM:
+            break
+        if rtype == _NTSKE_ERROR:
+            res["error"] = f"server error record {int.from_bytes(body, 'big')}"
+            return res
+        if rtype == _NTSKE_NEXTPROTO and len(body) >= 2:
+            proto = int.from_bytes(body[:2], "big")
+        elif rtype == _NTSKE_AEAD and len(body) >= 2:
+            aead = int.from_bytes(body[:2], "big")
+        elif rtype == _NTSKE_COOKIE:
+            res["cookies"] += 1
+    if proto != 0:
+        res["error"] = f"no NTPv4 next-protocol in response ({proto})"
+    elif aead != _AEAD_AES_SIV_CMAC_256:
+        res["error"] = f"AEAD AES-SIV-CMAC-256 not accepted ({aead})"
+    elif res["cookies"] < 1:
+        res["error"] = "no cookies received"
+    else:
+        res["ok"] = True
+    return res
+
+
+def _ntske_has_eom(buf):
+    i = 0
+    while i + 4 <= len(buf):
+        rtype = int.from_bytes(buf[i:i + 2], "big") & 0x7FFF
+        ln = int.from_bytes(buf[i + 2:i + 4], "big")
+        if i + 4 + ln > len(buf):
+            return False
+        if rtype == _NTSKE_EOM:
+            return True
+        i += 4 + ln
+    return False
+
+
+def check_nts(target_ip):
+    r = nts_ke_check(NTP_SERVER, target_ip)
+    days = r["cert_days"]
+    if r["ok"]:
+        logging.info(f"NTS-KE {NTP_SERVER} [{target_ip}]:{NTS_PORT} OK, cookies={r['cookies']}, cert expires in {days} d")
+    else:
+        logging.warning(f"NTS-KE {NTP_SERVER} [{target_ip}]:{NTS_PORT} FAILED: {r['error']}")
+    evaluate_condition(
+        "nts", not r["ok"],
+        build_msg("🔐", "NTS key establishment failed", NTP_SERVER, [
+            f"<b>NTS-KE:</b> <code>{_esc(target_ip)}:{NTS_PORT}</code> — {_esc(r['error'])}",
+            "Plain NTP may still work, but NTS clients cannot authenticate.",
+        ]),
+        build_msg("✅", "NTS key establishment recovered", NTP_SERVER,
+                  [f"<b>NTS-KE:</b> OK — {r['cookies']} cookies, certificate valid for {days} days."]),
+    )
+    if NTS_CERT_WARN_DAYS > 0 and days is not None:
+        evaluate_condition(
+            "ntscert", days < NTS_CERT_WARN_DAYS,
+            build_msg("📜", "NTS certificate expiring", NTP_SERVER, [
+                f"<b>Certificate</b> expires in <code>{days}</code> days (warn below <code>{NTS_CERT_WARN_DAYS}</code>) — renewal failing?",
+            ]),
+            build_msg("✅", "NTS certificate renewed", NTP_SERVER,
+                      [f"<b>Certificate</b> now valid for <code>{days}</code> days."]),
+            alert_after=1, recover_after=1,
+        )
+    update_nts_status(r["ok"], r["cookies"], days, r["error"])
+
+
 # ---------------- Main check ----------------
 
 def check_ntp_server():
@@ -387,6 +529,9 @@ def check_ntp_server():
         reset_streaks("offset", "localclock", "stratum", "leap", "rootdisp")
         update_status(reachable=False, proto=_PROTO_LABEL, target_ip=None)
         return
+
+    if NTS_CHECK:
+        check_nts(target_ip)   # independent of the UDP NTP result (TCP path / filters can differ, cf. IPv4 TCP 4460)
 
     responses = sample_server(target_ip)
 

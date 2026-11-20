@@ -51,5 +51,11 @@ ENV REFERENCE_NTP=""
 # Optional read-only HTTP status server (empty/unset = disabled = original behaviour)
 ENV HTTP_PORT=""
 
+# Optional NTS (RFC 8915) key-establishment check on TCP NTS_PORT (TLS 1.3, ALPN ntske/1, cookies),
+# pinned to NTP_IP_VERSION like the NTP query; NTS_CERT_WARN_DAYS>0 also alerts on certificate expiry.
+ENV NTS_CHECK="false"
+ENV NTS_PORT="4460"
+ENV NTS_CERT_WARN_DAYS="0"
+
 # Run the script
 CMD ["python", "ntp_monitor.py"]
